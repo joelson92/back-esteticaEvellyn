@@ -58,9 +58,19 @@ app.use((req, res, next) => {
     }
     return val;
   };
+
+  const shouldPreserveStructuredString = (key, val) => {
+    if (typeof val !== 'string') return false;
+    const trimmed = val.trim();
+    return ['servicesJson', 'services', 'selectedServices', 'selected_services', 'serviceIds', 'serviceNames', 'service_name', 'items', 'procedures'].includes(key) || trimmed.startsWith('{') || trimmed.startsWith('[');
+  };
+
   if (req.body) {
     for (const key in req.body) {
-      req.body[key] = sanitize(req.body[key]);
+      const value = req.body[key];
+      req.body[key] = typeof value === 'string' && !shouldPreserveStructuredString(key, value)
+        ? sanitize(value)
+        : value;
     }
   }
   next();
@@ -94,6 +104,44 @@ function buildServiceMatchQuery(id) {
   }
 
   return { serviceId: id };
+}
+
+function decodeStructuredString(value) {
+  if (typeof value !== 'string') return value;
+  return value
+    .replace(/&quot;/g, '"')
+    .replace(/&#x27;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>');
+}
+
+function normalizeAppointmentPayloadServices(body = {}) {
+  const values = [body.services, body.servicesJson, body.serviceNames, body.servicesText,
+    body.selectedServices, body.selected_services, body.service, body.serviceName,
+    body.service_name, body.items, body.procedures];
+  const normalizeList = (value) => {
+    if (value === undefined || value === null || value === '') return [];
+    if (Array.isArray(value)) return value;
+    if (typeof value === 'object') return [value];
+    if (typeof value !== 'string') return [];
+    const decoded = decodeStructuredString(value).trim();
+    if (!decoded) return [];
+    if (decoded.startsWith('[') || decoded.startsWith('{')) {
+      try { const parsed = JSON.parse(decoded); return Array.isArray(parsed) ? parsed : [parsed]; }
+      catch (error) { return []; }
+    }
+    return decoded.split(',').map((name) => name.trim()).filter(Boolean);
+  };
+  const raw = values.map(normalizeList).find((items) => items.length) || [];
+  return raw.map((item) => {
+    if (typeof item === 'string') return { id: '', name: item, price: 0, duration: 0 };
+    return {
+      id: String(item.id || item.serviceId || item.code || item.slug || item._id || ''),
+      name: String(item.name || item.nome || item.title || item.serviceName || item.service_name || item.descricao || item.description || '').trim(),
+      price: Number(item.price ?? item.preco ?? item.valor ?? item.value ?? 0),
+      duration: Number(item.duration ?? item.duracao ?? item.tempo ?? item.time ?? 0)
+    };
+  }).filter((item) => item.name);
 }
 
 function normalizeServicePayload(body = {}) {
@@ -159,13 +207,138 @@ function serializeClient(doc) {
   };
 }
 
-function serializeAppointment(doc) {
+async function normalizeAppointmentServices(appointment = {}) {
+  const normalizedItems = [];
+
+  const addItem = (value) => {
+    if (value === undefined || value === null) return;
+
+    if (Array.isArray(value)) {
+      value.forEach(addItem);
+      return;
+    }
+
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (!trimmed) return;
+
+      if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (Array.isArray(parsed)) {
+            parsed.forEach(addItem);
+          } else if (parsed && typeof parsed === 'object') {
+            addItem(parsed);
+          }
+        } catch (error) {
+          // fallback para string simples
+        }
+        return;
+      }
+
+      normalizedItems.push({
+        id: null,
+        name: trimmed,
+        price: null,
+        duration: null
+      });
+      return;
+    }
+
+    if (value && typeof value === 'object') {
+      const normalized = {
+        id: value.id || value.serviceId || value.code || value._id || null,
+        name: value.name || value.nome || value.title || value.serviceName || value.service_name || value.descricao || value.description || '',
+        price: value.price ?? value.preco ?? value.valor ?? value.value ?? null,
+        duration: value.duration ?? value.duracao ?? value.tempo ?? value.time ?? null
+      };
+
+      if (normalized.name) {
+        normalizedItems.push(normalized);
+      }
+    }
+  };
+
+  [
+    appointment.services,
+    appointment.servicesJson,
+    appointment.selectedServices,
+    appointment.service,
+    appointment.serviceName,
+    appointment.serviceNames,
+    appointment.items,
+    appointment.procedures,
+    appointment.service_name
+  ].forEach(addItem);
+
+  const seenServiceNames = new Set();
+  const normalizedServices = normalizedItems
+    .filter((item) => item.name)
+    .map((item) => ({
+      id: item.id || null,
+      name: String(item.name).trim(),
+      price: Number.isFinite(Number(item.price)) ? Number(item.price) : null,
+      duration: Number.isFinite(Number(item.duration)) ? Number(item.duration) : null
+    }))
+    .filter((item) => {
+      const key = item.name.toLocaleLowerCase('pt-BR');
+      if (seenServiceNames.has(key)) return false;
+      seenServiceNames.add(key);
+      return true;
+    });
+
+  if (normalizedServices.length === 0) {
+    const appointmentValue = Number(appointment.totalValue ?? appointment.value ?? appointment.price ?? appointment.preco ?? appointment.valor ?? 0);
+    const appointmentDuration = Number(appointment.duration ?? appointment.duracao ?? appointment.time ?? appointment.tempo ?? 0);
+
+    if (appointmentValue > 0 || appointmentDuration > 0) {
+      const serviceMatches = await Service.find({
+        price: appointmentValue,
+        duration: appointmentDuration
+      }).limit(10);
+
+      if (serviceMatches.length === 1) {
+        const match = serviceMatches[0];
+        return [{
+          id: match.serviceId || match._id?.toString?.() || null,
+          name: match.name || match.title || match.serviceName || 'Serviço não identificado',
+          price: Number(match.price || appointmentValue || 0),
+          duration: Number(match.duration || appointmentDuration || 0)
+        }];
+      }
+
+      return [{
+        id: null,
+        name: 'Serviço não identificado',
+        price: appointmentValue > 0 ? appointmentValue : null,
+        duration: appointmentDuration > 0 ? appointmentDuration : null
+      }];
+    }
+  }
+
+  if (process.env.NODE_ENV !== 'production') {
+    console.debug('Appointment services debug', { appointment, normalizedServices });
+  }
+
+  return normalizedServices;
+}
+
+async function serializeAppointment(doc) {
   const data = mapId(doc);
+  const normalizedServices = await normalizeAppointmentServices(data);
+  const serviceNames = normalizedServices.map((service) => service.name).filter(Boolean);
+  const servicesText = serviceNames.join(', ');
+
   return {
     ...data,
     _id: undefined,
+    services: normalizedServices,
+    servicesJson: data.servicesJson || JSON.stringify(normalizedServices),
+    serviceNames,
+    servicesText,
     totalValue: Number(data.totalValue || 0),
-    duration: Number(data.duration || 0),
+    duration: Number(data.duration || data.totalDuration || 0),
+    totalDuration: Number(data.totalDuration || data.duration || 0),
     status: data.status || 'scheduled',
     source: data.source || 'Sistema'
   };
@@ -346,7 +519,28 @@ app.get('/api/availability', async (req, res) => {
 });
 
 app.post('/api/appointments', async (req, res) => {
-  const { clientName, clientPhone, date, startTime, endTime, duration, totalValue, servicesJson, notes, googleEventId } = req.body;
+  if (process.env.NODE_ENV !== 'production') console.debug('APPOINTMENT CREATE BODY', req.body);
+  const {
+    clientName,
+    clientPhone,
+    date,
+    startTime,
+    endTime,
+    duration,
+    totalValue,
+    servicesJson,
+    services,
+    selectedServices,
+    selected_services,
+    serviceIds,
+    serviceNames,
+    service_name,
+    items,
+    procedures,
+    notes,
+    googleEventId
+  } = req.body;
+
   if (!clientName || !clientPhone || !date || !startTime) return res.status(400).json({ error: 'Dados incompletos' });
 
   try {
@@ -359,15 +553,70 @@ app.post('/api/appointments', async (req, res) => {
       await client.save();
     }
 
+    const normalizedServices = (() => {
+      const candidateSources = [services, selectedServices, selected_services, serviceIds, serviceNames, service_name, items, procedures];
+      const parseCandidateList = (value) => {
+        if (Array.isArray(value)) return value;
+        if (typeof value !== 'string') return null;
+        const decoded = decodeStructuredString(value).trim();
+        if (!decoded) return null;
+        if (decoded.startsWith('[') || decoded.startsWith('{')) {
+          try {
+            const parsed = JSON.parse(decoded);
+            return Array.isArray(parsed) ? parsed : null;
+          } catch (error) {
+            return null;
+          }
+        }
+        return [decoded];
+      };
+
+      const parsedServices = typeof servicesJson === 'string' && servicesJson.trim()
+        ? (() => { try { return JSON.parse(decodeStructuredString(servicesJson)); } catch (error) { return null; } })()
+        : null;
+
+      const rawList = candidateSources.map(parseCandidateList).find((value) => Array.isArray(value))
+        || (Array.isArray(parsedServices) ? parsedServices : null);
+      const list = Array.isArray(rawList) ? rawList : [];
+
+      if (!Array.isArray(list)) return [];
+
+      return list.map((item) => {
+        if (typeof item === 'string') {
+          return { id: item, nome: item, name: item };
+        }
+
+        if (item && typeof item === 'object') {
+          return {
+            id: item.id || item.serviceId || item.code || item._id || null,
+            nome: item.nome || item.name || item.title || item.serviceName || item.service_name || '',
+            name: item.name || item.nome || item.title || item.serviceName || item.service_name || '',
+            preco: item.preco ?? item.price ?? item.valor ?? item.value ?? null,
+            price: item.price ?? item.preco ?? item.valor ?? item.value ?? null,
+            duracao: item.duracao ?? item.duration ?? item.tempo ?? item.time ?? null,
+            duration: item.duration ?? item.duracao ?? item.tempo ?? item.time ?? null
+          };
+        }
+
+        return { id: null, nome: '', name: '' };
+      }).filter((item) => item.nome || item.name);
+    })();
+
+    const canonicalServices = normalizeAppointmentPayloadServices(req.body);
+    const canonicalServiceNames = canonicalServices.map((service) => service.name);
     const appointment = await Appointment.create({
       clientId: client._id,
       clientName,
       clientPhone,
-      servicesJson: servicesJson || '',
+      services: canonicalServices,
+      servicesJson: JSON.stringify(canonicalServices),
+      serviceNames: canonicalServiceNames,
+      servicesText: canonicalServiceNames.join(', '),
       date,
       startTime,
       endTime: endTime || startTime,
-      duration: Number(duration || 0),
+      duration: Number(duration || req.body.totalDuration || 0),
+      totalDuration: Number(req.body.totalDuration || duration || 0),
       totalValue: Number(totalValue || 0),
       notes: notes || '',
       googleEventId: googleEventId || '',
@@ -375,7 +624,8 @@ app.post('/api/appointments', async (req, res) => {
       status: 'scheduled'
     });
 
-    res.status(201).json({ message: 'Agendamento salvo', id: appointment._id.toString() });
+    if (process.env.NODE_ENV !== 'production') console.debug('APPOINTMENT SAVED', appointment.toObject());
+    res.status(201).json({ message: 'Agendamento salvo', id: appointment._id.toString(), appointment: await serializeAppointment(appointment) });
   } catch (error) {
     res.status(500).json({ error: 'Erro ao salvar agendamento' });
   }
@@ -493,14 +743,35 @@ app.delete('/api/admin/services/:id', authenticateToken, async (req, res) => {
 app.get('/api/admin/appointments', authenticateToken, async (req, res) => {
   try {
     const appointments = await Appointment.find().sort({ date: -1, startTime: -1 });
-    res.json(appointments.map(serializeAppointment));
+    const serializedAppointments = await Promise.all(appointments.map(serializeAppointment));
+    if (process.env.NODE_ENV !== 'production') console.debug('APPOINTMENTS RESPONSE SAMPLE', serializedAppointments[0]);
+    res.json(serializedAppointments);
   } catch (error) {
     res.status(500).json({ error: 'Erro no servidor' });
   }
 });
 
 app.post('/api/admin/appointments', authenticateToken, async (req, res) => {
-  const { clientName, clientPhone, date, startTime, endTime, duration, totalValue, servicesJson, notes, source } = req.body;
+  const {
+    clientName,
+    clientPhone,
+    date,
+    startTime,
+    endTime,
+    duration,
+    totalValue,
+    servicesJson,
+    services,
+    selectedServices,
+    selected_services,
+    serviceIds,
+    serviceNames,
+    service_name,
+    items,
+    procedures,
+    notes,
+    source
+  } = req.body;
   if (!clientName || !clientPhone || !date || !startTime || !endTime) {
     return res.status(400).json({ error: 'Dados incompletos.' });
   }
@@ -526,15 +797,70 @@ app.post('/api/admin/appointments', authenticateToken, async (req, res) => {
       await client.save();
     }
 
+    const normalizedServices = (() => {
+      const candidateSources = [services, selectedServices, selected_services, serviceIds, serviceNames, service_name, items, procedures];
+      const parseCandidateList = (value) => {
+        if (Array.isArray(value)) return value;
+        if (typeof value !== 'string') return null;
+        const decoded = decodeStructuredString(value).trim();
+        if (!decoded) return null;
+        if (decoded.startsWith('[') || decoded.startsWith('{')) {
+          try {
+            const parsed = JSON.parse(decoded);
+            return Array.isArray(parsed) ? parsed : null;
+          } catch (error) {
+            return null;
+          }
+        }
+        return [decoded];
+      };
+
+      const parsedServices = typeof servicesJson === 'string' && servicesJson.trim()
+        ? (() => { try { return JSON.parse(decodeStructuredString(servicesJson)); } catch (error) { return null; } })()
+        : null;
+
+      const rawList = candidateSources.map(parseCandidateList).find((value) => Array.isArray(value))
+        || (Array.isArray(parsedServices) ? parsedServices : null);
+      const list = Array.isArray(rawList) ? rawList : [];
+
+      if (!Array.isArray(list)) return [];
+
+      return list.map((item) => {
+        if (typeof item === 'string') {
+          return { id: item, nome: item, name: item };
+        }
+
+        if (item && typeof item === 'object') {
+          return {
+            id: item.id || item.serviceId || item.code || item._id || null,
+            nome: item.nome || item.name || item.title || item.serviceName || item.service_name || '',
+            name: item.name || item.nome || item.title || item.serviceName || item.service_name || '',
+            preco: item.preco ?? item.price ?? item.valor ?? item.value ?? null,
+            price: item.price ?? item.preco ?? item.valor ?? item.value ?? null,
+            duracao: item.duracao ?? item.duration ?? item.tempo ?? item.time ?? null,
+            duration: item.duration ?? item.duracao ?? item.tempo ?? item.time ?? null
+          };
+        }
+
+        return { id: null, nome: '', name: '' };
+      }).filter((item) => item.nome || item.name);
+    })();
+
+    const canonicalServices = normalizeAppointmentPayloadServices(req.body);
+    const canonicalServiceNames = canonicalServices.map((service) => service.name);
     const appointment = await Appointment.create({
       clientId: client._id,
       clientName,
       clientPhone,
-      servicesJson: servicesJson || '',
+      services: canonicalServices,
+      servicesJson: JSON.stringify(canonicalServices),
+      serviceNames: canonicalServiceNames,
+      servicesText: canonicalServiceNames.join(', '),
       date,
       startTime,
       endTime,
-      duration: Number(duration || 0),
+      duration: Number(duration || req.body.totalDuration || 0),
+      totalDuration: Number(req.body.totalDuration || duration || 0),
       totalValue: Number(totalValue || 0),
       notes: notes || '',
       source: source || 'Sistema',
