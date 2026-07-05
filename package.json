@@ -1,14 +1,21 @@
 {
-  "name": "estetica-evellyn-landing",
+  "name": "back-esteticaEvellyn",
   "version": "1.0.0",
-  "description": "Este repositório contém a Landing Page e o Sistema de Agendamentos Inteligente da Estética Evellyn. O projeto foi arquitetado como **HTML Estático Puro**, focando em altíssima performance, segurança e zero custo de infraestrutura.",
-  "main": "google_apps_script.js",
+  "description": "Backend da Estética Evellyn - API REST com Express, MongoDB Atlas e autenticação JWT.",
+  "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
     "dev": "node src/server.js"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "express",
+    "mongodb",
+    "mongoose",
+    "jwt",
+    "api",
+    "estetica"
+  ],
+  "author": "Joelson Veras",
   "license": "ISC",
   "dependencies": {
     "bcrypt": "^6.0.0",
