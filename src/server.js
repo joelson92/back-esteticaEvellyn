@@ -22,6 +22,7 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+const mongoose = require('mongoose');
 const { connectMongo, getConnectionStatus } = require('../database/mongoDatabase');
 const financeRoutes = require('./routes/finance');
 
@@ -83,6 +84,59 @@ function mapId(doc) {
   const data = doc.toObject ? doc.toObject() : { ...doc };
   const id = data.serviceId || data._id?.toString();
   return { ...data, id: id || data.id?.toString?.() || data._id?.toString?.() || null };
+}
+
+function buildServiceMatchQuery(id) {
+  if (!id) return null;
+
+  if (mongoose.isValidObjectId(id)) {
+    return { $or: [{ serviceId: id }, { _id: id }] };
+  }
+
+  return { serviceId: id };
+}
+
+function normalizeServicePayload(body = {}) {
+  const {
+    name,
+    category,
+    description,
+    price,
+    promoPrice,
+    promotionPrice,
+    duration,
+    active,
+    featured
+  } = body;
+
+  if (!name || !category || price === undefined || price === null || price === '' || duration === undefined || duration === null || duration === '') {
+    return { error: 'Campos obrigatórios faltando.' };
+  }
+
+  const parsedPrice = Number(price);
+  const parsedDuration = Number(duration);
+  const parsedPromoPrice = promoPrice !== undefined && promoPrice !== null && promoPrice !== ''
+    ? Number(promoPrice)
+    : promotionPrice !== undefined && promotionPrice !== null && promotionPrice !== ''
+      ? Number(promotionPrice)
+      : null;
+
+  if (Number.isNaN(parsedPrice) || Number.isNaN(parsedDuration) || (parsedPromoPrice !== null && Number.isNaN(parsedPromoPrice))) {
+    return { error: 'Preço, duração ou promoção inválidos.' };
+  }
+
+  return {
+    value: {
+      name,
+      category,
+      description: description || '',
+      price: parsedPrice,
+      promoPrice: parsedPromoPrice,
+      duration: parsedDuration,
+      active: Boolean(active),
+      featured: Boolean(featured)
+    }
+  };
 }
 
 function serializeService(doc) {
@@ -332,77 +386,107 @@ app.get('/api/admin/services', authenticateToken, async (req, res) => {
     const services = await Service.find().sort({ category: 1, price: 1 });
     res.json(services.map(serializeService));
   } catch (error) {
-    res.status(500).json({ error: 'Erro no servidor' });
+    console.error('Erro ao listar serviços:');
+    console.error(error);
+    res.status(500).json({
+      message: error.message,
+      stack: process.env.NODE_ENV !== 'production' ? error.stack : undefined
+    });
   }
 });
 
 app.post('/api/admin/services', authenticateToken, async (req, res) => {
-  const { id, name, category, description, price, promoPrice, duration, active, featured } = req.body;
+  const normalized = normalizeServicePayload(req.body);
 
-  if (!name || !category || price === undefined || !duration) {
-    return res.status(400).json({ error: 'Campos obrigatórios faltando.' });
+  if (!normalized.value) {
+    return res.status(400).json({ message: normalized.error });
   }
 
   try {
-    const serviceIdValue = id || `${Date.now()}`;
-    const existing = await Service.findOne({ $or: [{ serviceId: serviceIdValue }, { _id: serviceIdValue }] });
-    if (existing) return res.status(400).json({ error: 'ID de serviço já existe.' });
+    const serviceIdValue = req.body.id || req.body.code || `${Date.now()}`;
+    const existing = await Service.findOne(buildServiceMatchQuery(serviceIdValue));
+    if (existing) return res.status(400).json({ message: 'ID de serviço já existe.' });
 
-    await Service.create({
+    const created = await Service.create({
       serviceId: serviceIdValue,
-      name,
-      category,
-      description: description || '',
-      price: Number(price),
-      promoPrice: promoPrice != null ? Number(promoPrice) : null,
-      duration: Number(duration),
-      active: Boolean(active),
-      featured: Boolean(featured)
+      ...normalized.value
     });
-    res.status(201).json({ message: 'Serviço criado com sucesso.' });
+
+    res.status(201).json({ message: 'Serviço criado com sucesso.', service: serializeService(created) });
   } catch (error) {
-    res.status(500).json({ error: 'Erro ao salvar.' });
+    console.error('Erro ao criar serviço:');
+    console.error(error);
+
+    if (error.name === 'ValidationError') {
+      return res.status(400).json({ message: error.message });
+    }
+
+    if (error.name === 'CastError') {
+      return res.status(400).json({ message: `Erro de cast: ${error.message}` });
+    }
+
+    return res.status(500).json({
+      message: error.message,
+      stack: process.env.NODE_ENV !== 'production' ? error.stack : undefined
+    });
   }
 });
 
 app.put('/api/admin/services/:id', authenticateToken, async (req, res) => {
-  const { name, category, description, price, promoPrice, duration, active, featured } = req.body;
+  const normalized = normalizeServicePayload(req.body);
 
-  if (!name || !category || price === undefined || !duration) {
-    return res.status(400).json({ error: 'Campos obrigatórios faltando.' });
+  if (!normalized.value) {
+    return res.status(400).json({ message: normalized.error });
   }
 
   try {
     const service = await Service.findOneAndUpdate(
-      { $or: [{ serviceId: req.params.id }, { _id: req.params.id }] },
+      buildServiceMatchQuery(req.params.id),
       {
-        name,
-        category,
-        description: description || '',
-        price: Number(price),
-        promoPrice: promoPrice != null ? Number(promoPrice) : null,
-        duration: Number(duration),
-        active: Boolean(active),
-        featured: Boolean(featured),
+        ...normalized.value,
         updatedAt: new Date()
       },
-      { new: true }
+      { new: true, runValidators: true }
     );
 
-    if (!service) return res.status(404).json({ error: 'Serviço não encontrado.' });
-    res.json({ message: 'Serviço atualizado com sucesso.' });
+    if (!service) return res.status(404).json({ message: 'Serviço não encontrado.' });
+    return res.json({ message: 'Serviço atualizado com sucesso.', service: serializeService(service) });
   } catch (error) {
-    res.status(500).json({ error: 'Erro ao atualizar.' });
+    console.error('Erro ao atualizar serviço:');
+    console.error(error);
+
+    if (error.name === 'ValidationError') {
+      return res.status(400).json({ message: error.message });
+    }
+
+    if (error.name === 'CastError') {
+      return res.status(400).json({ message: `Erro de cast: ${error.message}` });
+    }
+
+    return res.status(500).json({
+      message: error.message,
+      stack: process.env.NODE_ENV !== 'production' ? error.stack : undefined
+    });
   }
 });
 
 app.delete('/api/admin/services/:id', authenticateToken, async (req, res) => {
   try {
-    const result = await Service.deleteOne({ $or: [{ serviceId: req.params.id }, { _id: req.params.id }] });
-    if (result.deletedCount === 0) return res.status(404).json({ error: 'Serviço não encontrado.' });
-    res.json({ message: 'Deletado com sucesso.' });
+    const result = await Service.deleteOne(buildServiceMatchQuery(req.params.id));
+    if (result.deletedCount === 0) return res.status(404).json({ message: 'Serviço não encontrado.' });
+    return res.json({ message: 'Deletado com sucesso.' });
   } catch (error) {
-    res.status(500).json({ error: 'Erro ao deletar.' });
+    console.error('Erro ao deletar serviço:');
+    console.error(error);
+
+    if (error.name === 'CastError') {
+      return res.status(400).json({ message: `Erro de cast: ${error.message}` });
+    }
+
+    return res.status(500).json({
+      message: error.message,
+      stack: process.env.NODE_ENV !== 'production' ? error.stack : undefined
+    });
   }
 });
 
