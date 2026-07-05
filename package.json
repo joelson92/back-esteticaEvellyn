@@ -1,0 +1,23 @@
+{
+  "name": "estetica-evellyn-landing",
+  "version": "1.0.0",
+  "description": "Este repositório contém a Landing Page e o Sistema de Agendamentos Inteligente da Estética Evellyn. O projeto foi arquitetado como **HTML Estático Puro**, focando em altíssima performance, segurança e zero custo de infraestrutura.",
+  "main": "google_apps_script.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node src/server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "bcrypt": "^6.0.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.5.2",
+    "helmet": "^8.2.0",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^9.7.3"
+  }
+}
